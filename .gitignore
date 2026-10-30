@@ -2,9 +2,4 @@ venv/
 .env
 __pycache__/
 *.pyc
-app.py
-listing_agent.py
-requirements.txt
-run_cli.py
 test_api.py
-test_gemini.py
