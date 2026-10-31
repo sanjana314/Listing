@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -9,8 +10,18 @@ from google.genai import types
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # The AI model. If you get a "not found" or "limit" error, change this one line
-# to "gemini-3.5-flash-lite" (also free).
+# to "gemini-3.5-flash-lite" (also listed with a free tier).
 MODEL = "gemini-3.8-flash"
+
+# OPTIONAL backup model. Leave it as "" (empty) to use only MODEL.
+# If you want a backup when Google says "503 busy", set it to
+# "gemini-3.5-flash-lite". It is tried ONLY after MODEL is still busy
+# (503) after its retries. It is never used for limit errors (429).
+FALLBACK_MODEL = ""
+
+# How long to wait between tries when Google says 503 (busy):
+# try 1 -> wait 3s -> try 2 -> wait 8s -> try 3 -> give up.
+BUSY_WAITS = (3, 8)
 
 CATEGORIES = [
     "Electronics", "Fashion", "Home & Kitchen", "Books",
@@ -39,30 +50,65 @@ def get_client():
     return _client
 
 
+def _error_code(error):
+    """Return the HTTP code from a Gemini error (503, 429, ...) or None."""
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        return code
+    text = str(error)
+    if "503" in text or "UNAVAILABLE" in text:
+        return 503
+    if "429" in text or "RESOURCE_EXHAUSTED" in text:
+        return 429
+    return None
+
+
+def _call_gemini(model, instruction, image_bytes, details, mime):
+    """One request to Gemini with one model."""
+    response = get_client().models.generate_content(
+        model=model,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime),
+            f"Seller details: {details}\n\n{instruction}",
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_RULES,
+            response_mime_type="application/json",
+        ),
+    )
+    return (response.text or "").strip()
+
+
 def ask_ai(instruction, image_bytes, details, mime="image/jpeg"):
     """Send photo + details to Gemini and return the text answer.
-    If the free limit is hit (error 429), wait a little and try again."""
+    - 503 (Google is busy): wait a few seconds and try again (max 3 tries),
+      then try FALLBACK_MODEL the same way if you set one.
+    - 429 (free limit hit): wait and try again on the SAME model, never switch.
+    - Any other error: stop at once and explain."""
+    models = [MODEL]
+    if FALLBACK_MODEL and FALLBACK_MODEL != MODEL:
+        models.append(FALLBACK_MODEL)
+
     last_error = None
-    for attempt in range(3):
-        try:
-            response = get_client().models.generate_content(
-                model=MODEL,
-                contents=[
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime),
-                    f"Seller details: {details}\n\n{instruction}",
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_RULES,
-                    response_mime_type="application/json",
-                ),
-            )
-            return (response.text or "").strip()
-        except Exception as error:  # keep it simple: retry, then explain
-            last_error = error
-            if "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error):
-                time.sleep(20 * (attempt + 1))   # wait 20s, then 40s
-            else:
-                break
+    for model in models:
+        tries = len(BUSY_WAITS) + 1
+        for attempt in range(tries):
+            try:
+                return _call_gemini(model, instruction, image_bytes, details, mime)
+            except Exception as error:  # keep it simple: retry, then explain
+                last_error = error
+                code = _error_code(error)
+                if code == 429:
+                    # Free limit: same model only, wait 20s then 40s.
+                    if attempt < 2:
+                        time.sleep(20 * (attempt + 1))
+                        continue
+                    raise RuntimeError(f"Gemini call failed: {last_error}")
+                if code == 503:
+                    if attempt < tries - 1:
+                        time.sleep(BUSY_WAITS[attempt])
+                    continue  # after the last try, the next model (if any)
+                raise RuntimeError(f"Gemini call failed: {error}")
     raise RuntimeError(f"Gemini call failed: {last_error}")
 
 
